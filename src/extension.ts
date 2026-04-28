@@ -4,65 +4,28 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { exec } from 'child_process';
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+const SERVER_URL = 'http://localhost:8765';
 
 interface AgentSettings {
     language: 'ro' | 'en';
     model: string;
-    availableModels: string[];
 }
 
-// ─── Ollama Helpers ─────────────────────────────────────────────────────────
-
-function getAvailableModels(): Promise<string[]> {
-    return new Promise((resolve) => {
-        const options = {
-            hostname: 'localhost', port: 11434,
-            path: '/api/tags', method: 'GET'
-        };
-        const req = http.request(options, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                try {
-                    const parsed = JSON.parse(data);
-                    const models = parsed.models?.map((m: any) => m.name) || [];
-                    resolve(models);
-                } catch { resolve([]); }
-            });
-        });
-        req.on('error', () => resolve([]));
-        req.end();
-    });
-}
-
-function askAgent(
-    message: string,
-    history: Array<{role: string, content: string}>,
-    systemPrompt: string,
-    model: string
-): Promise<string> {
+function httpPost(url: string, data: object): Promise<any> {
     return new Promise((resolve, reject) => {
-        const messages = [
-            { role: "system", content: systemPrompt },
-            ...history,
-            { role: "user", content: message }
-        ];
-        const body = JSON.stringify({ model, messages, stream: false });
+        const body = JSON.stringify(data);
+        const urlObj = new URL(url);
         const options = {
-            hostname: 'localhost', port: 11434,
-            path: '/api/chat', method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
+            hostname: urlObj.hostname,
+            port: parseInt(urlObj.port),
+            path: urlObj.pathname,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
         };
         const req = http.request(options, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                try {
-                    const parsed = JSON.parse(data);
-                    resolve(parsed.message?.content || 'Eroare la parsare răspuns');
-                } catch { reject(new Error('JSON parse error')); }
-            });
+            let d = '';
+            res.on('data', chunk => d += chunk);
+            res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Parse error')); } });
         });
         req.on('error', reject);
         req.write(body);
@@ -70,41 +33,18 @@ function askAgent(
     });
 }
 
-// ─── Context Helpers ─────────────────────────────────────────────────────────
-
-function getProjectContext(): string {
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders) return '';
-    const root = folders[0].uri.fsPath;
-    const ignored = new Set(['node_modules', '.git', '__pycache__', '.next', 'dist', 'out']);
-    function walk(dir: string, level = 0): string {
-        if (level > 2) return '';
-        let result = '';
-        try {
-            for (const item of fs.readdirSync(dir)) {
-                if (ignored.has(item) || item.startsWith('.')) continue;
-                const full = path.join(dir, item);
-                const indent = '  '.repeat(level);
-                if (fs.statSync(full).isDirectory()) {
-                    result += `${indent}📁 ${item}/\n` + walk(full, level + 1);
-                } else {
-                    result += `${indent}📄 ${item}\n`;
-                }
-            }
-        } catch {}
-        return result;
-    }
-    const active = vscode.window.activeTextEditor?.document.fileName || '';
-    const activeRel = active ? path.relative(root, active) : 'niciunul';
-    return `Proiect: ${path.basename(root)}\nCale: ${root}\nFișier activ: ${activeRel}\n\nStructură:\n${walk(root)}`;
+function httpGet(url: string): Promise<any> {
+    return new Promise((resolve, reject) => {
+        http.get(url, (res) => {
+            let d = '';
+            res.on('data', chunk => d += chunk);
+            res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Parse error')); } });
+        }).on('error', reject);
+    });
 }
 
-function getActiveFileContent(): string {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) return '';
-    const doc = editor.document;
-    const lines = doc.getText().split('\n').slice(0, 200).join('\n');
-    return `\n\nFișier activ (${path.basename(doc.fileName)}):\n\`\`\`\n${lines}\n\`\`\``;
+function checkServer(): Promise<boolean> {
+    return httpGet(`${SERVER_URL}/health`).then(() => true).catch(() => false);
 }
 
 function runGitCommand(command: string, cwd: string): Promise<string> {
@@ -115,180 +55,63 @@ function runGitCommand(command: string, cwd: string): Promise<string> {
     });
 }
 
-async function getGitContext(root: string): Promise<string> {
-    try {
-        const [status, branch] = await Promise.all([
-            runGitCommand('status --short', root),
-            runGitCommand('branch --show-current', root)
-        ]);
-        if (!status && !branch) return '';
-        return `\nGit branch: ${branch.trim()}\nGit status:\n${status}`;
-    } catch { return ''; }
-}
-
-function readMemory(memPath: string): string {
-    try {
-        if (fs.existsSync(memPath)) return fs.readFileSync(memPath, 'utf8');
-    } catch {}
-    return '';
-}
-
-function writeMemory(memPath: string, content: string): void {
-    try { fs.writeFileSync(memPath, content, 'utf8'); } catch {}
-}
-
-function buildSystemPrompt(language: 'ro' | 'en', projectCtx: string): string {
-    if (language === 'en') {
-        return `You are WildArt Agent, a local AI assistant specialized in programming.
-Always respond in ENGLISH. Be concise and direct.
-
-${projectCtx}
-
-You can help with: reading/writing files, git operations, code refactoring, finding functions, generating tests.
-When asked to modify code, show changes clearly with code blocks.`;
-    }
-    return `Ești WildArt Agent, un agent AI local specializat în programare.
-Răspunde ÎNTOTDEAUNA în ROMÂNĂ. Fii concis și direct.
-
-${projectCtx}
-
-Poți ajuta cu: citire/scriere fișiere, operații git, refactoring cod, găsire funcții, generare teste.
-Când ți se cere să modifici cod, arată modificările clar cu blocuri de cod.`;
-}
-
-// ─── Extension ──────────────────────────────────────────────────────────────
-
 export function activate(context: vscode.ExtensionContext) {
     const provider = new WildArtAgentPanel(context);
-
-    context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('wildartAgent', provider)
-    );
-
-    context.subscriptions.push(
-        vscode.commands.registerCommand('wildartAgent.clearChat', () => provider.clearChat())
-    );
-
-    context.subscriptions.push(
-        vscode.commands.registerCommand('wildartAgent.gitCommit', () => provider.quickGitCommit())
-    );
-
-    context.subscriptions.push(
-        vscode.commands.registerCommand('wildartAgent.selectModel', () => provider.selectModel())
-    );
-
-    context.subscriptions.push(
-        vscode.commands.registerCommand('wildartAgent.selectLanguage', () => provider.selectLanguage())
-    );
+    context.subscriptions.push(vscode.window.registerWebviewViewProvider('wildartAgent', provider));
+    context.subscriptions.push(vscode.commands.registerCommand('wildartAgent.clearChat', () => provider.clearChat()));
+    context.subscriptions.push(vscode.commands.registerCommand('wildartAgent.gitCommit', () => provider.quickGitCommit()));
+    context.subscriptions.push(vscode.commands.registerCommand('wildartAgent.selectLanguage', () => provider.selectLanguage()));
 }
-
-// ─── Panel ──────────────────────────────────────────────────────────────────
 
 class WildArtAgentPanel implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
-    private _history: Array<{role: string, content: string}> = [];
-    private _settings: AgentSettings = {
-        language: 'ro',
-        model: 'qwen2.5-coder:7b',
-        availableModels: []
-    };
+    private _settings: AgentSettings;
+    private _sessionId: string;
 
     constructor(private readonly _context: vscode.ExtensionContext) {
-        // Încarcă setările salvate
         const saved = _context.globalState.get<AgentSettings>('wildartSettings');
-        if (saved) this._settings = { ...this._settings, ...saved };
-    }
-
-    private saveSettings() {
-        this._context.globalState.update('wildartSettings', this._settings);
+        this._settings = saved || { language: 'ro', model: 'qwen2.5-coder:7b' };
+        this._sessionId = 'vscode_' + Date.now();
     }
 
     clearChat() {
-        this._history = [];
+        const root = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '';
+        httpPost(`${SERVER_URL}/reset`, { project_path: root, session_id: this._sessionId }).catch(() => {});
         this._view?.webview.postMessage({ type: 'clear' });
     }
 
-    async selectModel() {
-        // Fetch modele disponibile din Ollama
-        const models = await getAvailableModels();
-        if (models.length === 0) {
-            vscode.window.showErrorMessage('Nu pot contacta Ollama. Verifică că rulează pe localhost:11434');
-            return;
-        }
-        this._settings.availableModels = models;
-        const selected = await vscode.window.showQuickPick(models, {
-            placeHolder: `Model curent: ${this._settings.model}`,
-            title: 'Selectează modelul AI'
-        });
-        if (selected) {
-            this._settings.model = selected;
-            this.saveSettings();
-            this._view?.webview.postMessage({ 
-                type: 'settingsUpdate', 
-                model: selected,
-                language: this._settings.language 
-            });
-            vscode.window.showInformationMessage(`✅ Model schimbat: ${selected}`);
-        }
-    }
-
     async selectLanguage() {
-        const options = [
-            { label: '🇷🇴 Română', value: 'ro' },
-            { label: '🇬🇧 English', value: 'en' }
-        ];
-        const selected = await vscode.window.showQuickPick(
-            options.map(o => o.label),
-            { title: 'Selectează limba agentului' }
-        );
+        const options = ['🇷🇴 Română', '🇬🇧 English'];
+        const selected = await vscode.window.showQuickPick(options, { title: 'Selectează limba' });
         if (selected) {
             this._settings.language = selected.includes('English') ? 'en' : 'ro';
-            this.saveSettings();
-            this._view?.webview.postMessage({ 
-                type: 'settingsUpdate',
-                model: this._settings.model,
-                language: this._settings.language
-            });
-            const msg = this._settings.language === 'en' 
-                ? '✅ Language changed to English' 
-                : '✅ Limbă schimbată în Română';
-            vscode.window.showInformationMessage(msg);
+            this._context.globalState.update('wildartSettings', this._settings);
+            this._view?.webview.postMessage({ type: 'settingsUpdate', language: this._settings.language });
+            vscode.window.showInformationMessage(this._settings.language === 'en' ? '✅ English' : '✅ Română');
         }
     }
 
     async quickGitCommit() {
         const root = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
         if (!root) { vscode.window.showErrorMessage('Niciun proiect deschis'); return; }
-
         const diff = await runGitCommand('diff --staged', root);
-        if (!diff) {
-            vscode.window.showWarningMessage(
-                this._settings.language === 'en' 
-                    ? 'No staged files. Run git add first.' 
-                    : 'Nu există fișiere staged. Rulează git add mai întâi.'
-            );
-            return;
-        }
+        if (!diff) { vscode.window.showWarningMessage('Nu există fișiere staged.'); return; }
 
-        const prompt = this._settings.language === 'en'
-            ? 'Generate a short commit message for this diff. Respond ONLY with the message, max 72 chars.'
-            : 'Generează un mesaj de commit scurt pentru acest diff. Răspunde DOAR cu mesajul, max 72 caractere.';
-
-        const commitMsg = await askAgent(
-            `${prompt}\n\n${diff.slice(0, 1000)}`,
-            [], prompt, this._settings.model
-        );
+        const result = await httpPost(`${SERVER_URL}/chat`, {
+            message: `Generează DOAR un mesaj de commit scurt (max 72 chars) pentru acest diff:\n${diff.slice(0, 800)}`,
+            project_path: root,
+            session_id: this._sessionId + '_commit'
+        });
 
         const confirmed = await vscode.window.showInputBox({
-            prompt: this._settings.language === 'en' ? 'AI generated commit message' : 'Mesaj commit generat de AI',
-            value: commitMsg.trim()
+            prompt: 'Mesaj commit generat de AI',
+            value: result.response?.trim() || ''
         });
 
         if (confirmed) {
             await runGitCommand('add -A', root);
             await runGitCommand(`commit -m "${confirmed}"`, root);
             vscode.window.showInformationMessage(`✅ Commit: ${confirmed}`);
-            this._view?.webview.postMessage({ type: 'response', text: `✅ Commit: "${confirmed}"` });
         }
     }
 
@@ -297,52 +120,51 @@ class WildArtAgentPanel implements vscode.WebviewViewProvider {
         webviewView.webview.options = { enableScripts: true };
         webviewView.webview.html = this._getHtml();
 
-        // Trimite setările curente la webview
-        setTimeout(() => {
+        const root = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '';
+
+        // Verifică serverul și setează proiectul
+        setTimeout(async () => {
+            const serverOk = await checkServer();
+            if (serverOk && root) {
+                await httpPost(`${SERVER_URL}/set_project`, {
+                    project_path: root,
+                    session_id: this._sessionId
+                }).catch(() => {});
+            }
             webviewView.webview.postMessage({
-                type: 'settingsUpdate',
-                model: this._settings.model,
+                type: 'serverStatus',
+                online: serverOk,
                 language: this._settings.language
             });
         }, 500);
-
-        const root = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '';
-        const memPath = root ? path.join(root, '.wildart-memory.json') : '';
 
         webviewView.webview.onDidReceiveMessage(async (data) => {
             if (data.type === 'message') {
                 try {
                     webviewView.webview.postMessage({ type: 'thinking' });
 
-                    const projectCtx = getProjectContext();
-                    const fileContent = getActiveFileContent();
-                    const gitCtx = root ? await getGitContext(root) : '';
-                    const memory = memPath ? readMemory(memPath) : '';
-
-                    const fullContext = `${memory ? `MEMORIE PROIECT:\n${memory}\n\n` : ''}CONTEXT:\n${projectCtx}${fileContent}${gitCtx}`;
-                    const systemPrompt = buildSystemPrompt(this._settings.language, fullContext);
-
-                    const response = await askAgent(data.text, this._history, systemPrompt, this._settings.model);
-
-                    this._history.push({ role: 'user', content: data.text });
-                    this._history.push({ role: 'assistant', content: response });
-
-                    // Auto-save memorie
-                    if (data.text.toLowerCase().includes('ține minte') || 
-                        data.text.toLowerCase().includes('remember')) {
-                        const entry = `[${new Date().toLocaleDateString()}] ${data.text}: ${response.slice(0, 200)}\n`;
-                        if (memPath) writeMemory(memPath, readMemory(memPath) + entry);
+                    const serverOk = await checkServer();
+                    if (!serverOk) {
+                        webviewView.webview.postMessage({
+                            type: 'response',
+                            text: '❌ Serverul nu rulează!\n\nDeschide un terminal și rulează:\ncd ~/executive-agent && python3 server.py'
+                        });
+                        return;
                     }
 
-                    webviewView.webview.postMessage({ type: 'response', text: response });
+                    const response = await httpPost(`${SERVER_URL}/chat`, {
+                        message: data.text,
+                        project_path: root,
+                        session_id: this._sessionId
+                    });
+
+                    webviewView.webview.postMessage({ type: 'response', text: response.response });
                 } catch {
-                    const errMsg = this._settings.language === 'en'
-                        ? '❌ Cannot contact Ollama. Check it runs on localhost:11434'
-                        : '❌ Nu pot contacta Ollama. Verifică că rulează pe localhost:11434';
-                    webviewView.webview.postMessage({ type: 'response', text: errMsg });
+                    webviewView.webview.postMessage({
+                        type: 'response',
+                        text: '❌ Eroare conexiune server. Verifică că rulează:\npython3 ~/executive-agent/server.py'
+                    });
                 }
-            } else if (data.type === 'selectModel') {
-                this.selectModel();
             } else if (data.type === 'selectLanguage') {
                 this.selectLanguage();
             }
@@ -367,20 +189,16 @@ class WildArtAgentPanel implements vscode.WebviewViewProvider {
     padding: 8px 0; border-bottom: 1px solid var(--vscode-panel-border); margin-bottom: 8px;
   }
   #header h2 { font-size: 13px; font-weight: 600; }
+  #server-status {
+    font-size: 10px; padding: 2px 8px; border-radius: 10px;
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+  }
   #header-actions { display: flex; gap: 4px; }
   .icon-btn {
     background: transparent; border: none; color: var(--vscode-foreground);
     cursor: pointer; font-size: 13px; padding: 3px 6px; border-radius: 4px; opacity: 0.7;
   }
   .icon-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
-  #status-bar {
-    display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap;
-  }
-  .status-chip {
-    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
-    border-radius: 10px; padding: 2px 8px; font-size: 10px; cursor: pointer;
-  }
-  .status-chip:hover { opacity: 0.8; }
   #chat {
     flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 4px 0;
   }
@@ -394,6 +212,7 @@ class WildArtAgentPanel implements vscode.WebviewViewProvider {
   }
   .agent { background: var(--vscode-editor-inactiveSelectionBackground); align-self: flex-start; max-width: 95%; }
   .thinking { color: var(--vscode-descriptionForeground); font-style: italic; font-size: 11px; }
+  .error { color: var(--vscode-errorForeground); font-size: 11px; }
   #input-area {
     display: flex; gap: 6px; padding-top: 8px; border-top: 1px solid var(--vscode-panel-border);
   }
@@ -415,21 +234,19 @@ class WildArtAgentPanel implements vscode.WebviewViewProvider {
 <div id="header">
   <div style="display:flex;align-items:center;gap:8px">
     <span>🤖</span><h2>WildArt Agent</h2>
+    <span id="server-status">⏳ conectare...</span>
   </div>
   <div id="header-actions">
-    <button class="icon-btn" onclick="clearChat()" title="Reset chat">🗑️</button>
+    <button class="icon-btn" onclick="selectLanguage()" title="Limbă">🌐</button>
     <button class="icon-btn" onclick="gitCommit()" title="Git commit">📦</button>
+    <button class="icon-btn" onclick="clearChat()" title="Reset">🗑️</button>
   </div>
 </div>
-<div id="status-bar">
-  <span class="status-chip" onclick="selectModel()" id="model-chip">⚙️ model</span>
-  <span class="status-chip" onclick="selectLanguage()" id="lang-chip">🌐 lang</span>
-</div>
 <div id="chat">
-  <div class="msg agent">Salut! Sunt WildArt Agent 🤖\nVăd proiectul tău și fișierul activ.\n\nClick pe ⚙️ pentru model și 🌐 pentru limbă.</div>
+  <div class="msg agent">Salut! Sunt WildArt Agent 🤖\nMă conectez la server...</div>
 </div>
 <div id="input-area">
-  <textarea id="input" rows="2" placeholder="Scrie o comandă... (Enter = trimite, Shift+Enter = linie nouă)"></textarea>
+  <textarea id="input" rows="2" placeholder="Scrie o comandă..."></textarea>
   <button id="send">▶</button>
 </div>
 <script>
@@ -437,6 +254,7 @@ class WildArtAgentPanel implements vscode.WebviewViewProvider {
   const chat = document.getElementById('chat');
   const input = document.getElementById('input');
   const send = document.getElementById('send');
+  const serverStatus = document.getElementById('server-status');
 
   function addMsg(text, cls) {
     const div = document.createElement('div');
@@ -449,7 +267,6 @@ class WildArtAgentPanel implements vscode.WebviewViewProvider {
 
   function clearChat() { vscode.postMessage({ type: 'clearChat' }); }
   function gitCommit() { vscode.postMessage({ type: 'gitCommit' }); }
-  function selectModel() { vscode.postMessage({ type: 'selectModel' }); }
   function selectLanguage() { vscode.postMessage({ type: 'selectLanguage' }); }
 
   send.addEventListener('click', sendMsg);
@@ -469,7 +286,7 @@ class WildArtAgentPanel implements vscode.WebviewViewProvider {
   window.addEventListener('message', e => {
     const msg = e.data;
     if (msg.type === 'thinking') {
-      addMsg('⏳ ...', 'thinking');
+      addMsg('⏳ Gândesc...', 'thinking');
     } else if (msg.type === 'response') {
       document.querySelector('.thinking')?.remove();
       addMsg(msg.text, 'agent');
@@ -477,9 +294,18 @@ class WildArtAgentPanel implements vscode.WebviewViewProvider {
       input.focus();
     } else if (msg.type === 'clear') {
       chat.innerHTML = '<div class="msg agent">Chat resetat.</div>';
+    } else if (msg.type === 'serverStatus') {
+      if (msg.online) {
+        serverStatus.textContent = '🟢 online';
+        serverStatus.style.background = 'rgba(0,200,0,0.2)';
+        chat.innerHTML = '<div class="msg agent">✅ Server conectat! Cu ce te ajut?</div>';
+      } else {
+        serverStatus.textContent = '🔴 offline';
+        serverStatus.style.background = 'rgba(200,0,0,0.2)';
+        chat.innerHTML = '<div class="msg error">❌ Serverul nu rulează!\n\nDeschide terminal și rulează:\ncd ~/executive-agent\npython3 server.py</div>';
+      }
     } else if (msg.type === 'settingsUpdate') {
-      document.getElementById('model-chip').textContent = '⚙️ ' + msg.model;
-      document.getElementById('lang-chip').textContent = msg.language === 'en' ? '🇬🇧 English' : '🇷🇴 Română';
+      // update language display
     }
   });
 </script>
